@@ -5,7 +5,7 @@ import subprocess
 
 def parse_time(time_str):
     """
-    Parse a time string (hh:mm:ss, mm:ss, or ss) into seconds (float).
+    Convert a time string (hh:mm:ss, mm:ss, or ss) into seconds as a float.
     """
     parts = time_str.split(':')
     try:
@@ -18,8 +18,9 @@ def parse_time(time_str):
     return seconds
 
 def main():
+    # Create argument parser
     parser = argparse.ArgumentParser(
-        description="Remove a segment from a video file using FFmpeg with precise trimming or removal from start/end."
+        description="Remove a portion of a video file using FFmpeg with precise trimming or removal from start/end."
     )
     parser.add_argument(
         "input_file",
@@ -28,58 +29,66 @@ def main():
     parser.add_argument(
         "--from",
         dest="start",
-        help="Start time of segment to remove (format hh:mm:ss, mm:ss or ss)"
+        help="Start time of the segment to remove (format: hh:mm:ss, mm:ss or ss)"
     )
     parser.add_argument(
         "--to",
         dest="end",
-        help="End time of segment to remove (format hh:mm:ss, mm:ss, ss or END)"
+        help="End time of the segment to remove (format: hh:mm:ss, mm:ss, ss or END)"
     )
-    args = parser.parse_args()
 
+    # Allow flags and positional arguments to be mixed
+    args = parser.parse_intermixed_args()
+
+    # Ensure at least one of --from or --to is provided
     if args.start is None and (args.end is None or args.end.upper() == "END"):
-        parser.error("You must specify at least --from or a --to time.")
+        parser.error("You must specify at least --from or --to.")
 
     input_file = args.input_file
     base, _ = os.path.splitext(input_file)
     output_file = f"{base}.new.mp4"
 
-    have_start = args.start is not None
-    have_end = args.end is not None and args.end.upper() != "END"
+    # Determine which arguments are provided
+    has_start = args.start is not None
+    has_end = args.end is not None and args.end.upper() != "END"
 
-    # Determine times
-    start_sec = parse_time(args.start) if have_start else 0.0
-    end_sec = parse_time(args.end) if have_end else None
+    # Parse times
+    start_sec = parse_time(args.start) if has_start else None
+    end_sec = parse_time(args.end) if has_end else None
 
-    # Validate times
-    if have_start and have_end and end_sec <= start_sec:
+    # Validate time order
+    if has_start and has_end and end_sec <= start_sec:
         parser.error("`--to` time must be greater than `--from` time.")
 
-    # Build filter_complex
-    filter_parts = []
+    filter_segments = []
 
-    # Case: remove from start until end => keep tail only
-    if not have_start and have_end:
-        f1 = f"[0:v]trim=start={end_sec},setpts=PTS-STARTPTS[v1];"
-        a1 = f"[0:a]atrim=start={end_sec},asetpts=PTS-STARTPTS[a1];"
-        filter_parts.extend([f1, a1, "[v1][a1]concat=n=1:v=1:a=1[outv][outa]"])
+    # Case: only --from provided -> remove from start_sec to end of file
+    if has_start and not has_end:
+        # Keep only the tail part after start_sec
+        filter_segments.append(f"[0:v]trim=start={start_sec},setpts=PTS-STARTPTS[v1];")
+        filter_segments.append(f"[0:a]atrim=start={start_sec},asetpts=PTS-STARTPTS[a1];")
+        filter_segments.append("[v1][a1]concat=n=1:v=1:a=1[outv][outa]")
 
-    # Case: remove from start to EOF => keep head only
-    elif have_start and not have_end:
-        f0 = f"[0:v]trim=start=0:end={start_sec},setpts=PTS-STARTPTS[v0];"
-        a0 = f"[0:a]atrim=start=0:end={start_sec},asetpts=PTS-STARTPTS[a0];"
-        filter_parts.extend([f0, a0, "[v0][a0]concat=n=1:v=1:a=1[outv][outa]"])
+    # Case: only --to provided -> remove from start of file to end_sec
+    elif has_end and not has_start:
+        # Keep only the head part after end_sec
+        filter_segments.append(f"[0:v]trim=start={end_sec},setpts=PTS-STARTPTS[v1];")
+        filter_segments.append(f"[0:a]atrim=start={end_sec},asetpts=PTS-STARTPTS[a1];")
+        filter_segments.append("[v1][a1]concat=n=1:v=1:a=1[outv][outa]")
 
-    # Case: remove a middle segment => keep head and tail
+    # Case: both --from and --to provided -> remove middle segment
     else:
-        f0 = f"[0:v]trim=start=0:end={start_sec},setpts=PTS-STARTPTS[v0];"
-        a0 = f"[0:a]atrim=start=0:end={start_sec},asetpts=PTS-STARTPTS[a0];"
-        f1 = f"[0:v]trim=start={end_sec},setpts=PTS-STARTPTS[v1];"
-        a1 = f"[0:a]atrim=start={end_sec},asetpts=PTS-STARTPTS[a1];"
-        filter_parts.extend([f0, a0, f1, a1, "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"])
+        # Keep head segment from 0 to start_sec
+        filter_segments.append(f"[0:v]trim=start=0:end={start_sec},setpts=PTS-STARTPTS[v0];")
+        filter_segments.append(f"[0:a]atrim=start=0:end={start_sec},asetpts=PTS-STARTPTS[a0];")
+        # Keep tail segment from end_sec to EOF
+        filter_segments.append(f"[0:v]trim=start={end_sec},setpts=PTS-STARTPTS[v1];")
+        filter_segments.append(f"[0:a]atrim=start={end_sec},asetpts=PTS-STARTPTS[a1];")
+        filter_segments.append("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]")
 
-    filter_complex = ''.join(filter_parts)
+    filter_complex = ''.join(filter_segments)
 
+    # Build FFmpeg command
     cmd = [
         "ffmpeg", "-y", "-i", input_file,
         "-filter_complex", filter_complex,
