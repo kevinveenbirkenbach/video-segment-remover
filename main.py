@@ -2,78 +2,84 @@
 import argparse
 import os
 import subprocess
-import tempfile
 
-def run_ffmpeg(cmd):
+def parse_time(time_str):
     """
-    Helper to run an ffmpeg command and print it.
+    Parse a time string (hh:mm:ss, mm:ss, or ss) into seconds (float).
     """
-    print(f"Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    parts = time_str.split(':')
+    try:
+        parts = [float(p) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid time format: {time_str}")
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove a segment from a video file using ffmpeg."
+        description="Remove a segment from a video file using FFmpeg with precise trimming."
     )
     parser.add_argument(
         "input_file",
-        help="Input video file"
+        help="Path to the input video file"
     )
     parser.add_argument(
         "--from",
         dest="start",
         required=True,
-        help="Start time of the segment to remove (format hh:mm:ss)"
+        help="Start time of segment to remove (format hh:mm:ss, mm:ss or ss)"
     )
     parser.add_argument(
         "--to",
         dest="end",
         required=True,
-        help="End time of the segment to remove (format hh:mm:ss or END)"
+        help="End time of segment to remove (format hh:mm:ss, mm:ss, ss or END)"
     )
     args = parser.parse_args()
 
     input_file = args.input_file
-    base, ext = os.path.splitext(input_file)
+    base, _ = os.path.splitext(input_file)
     output_file = f"{base}.new.mp4"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        part1 = os.path.join(tmpdir, "part1.mp4")
-        part2 = os.path.join(tmpdir, "part2.mp4")
-        files_txt = os.path.join(tmpdir, "files.txt")
+    # Convert times to seconds
+    start_sec = parse_time(args.start)
+    end_val = args.end.upper()
+    end_sec = None
+    if end_val != "END":
+        end_sec = parse_time(args.end)
+        if end_sec <= start_sec:
+            parser.error("`--to` time must be greater than `--from` time.")
 
-        # Extract the segment before the removal start
-        cmd1 = [
-            "ffmpeg", "-y", "-i", input_file,
-            "-ss", "00:00:00", "-to", args.start,
-            "-c", "copy", part1
-        ]
-        run_ffmpeg(cmd1)
+    # Build filter_complex
+    # Part before removal: from 0 to start_sec
+    f0 = f"[0:v]trim=start=0:end={start_sec},setpts=PTS-STARTPTS[v0];"
+    a0 = f"[0:a]atrim=start=0:end={start_sec},asetpts=PTS-STARTPTS[a0];"
 
-        # If removing until end, just rename part1 to output
-        if args.end.upper() == "END":
-            os.replace(part1, output_file)
-            print(f"Output written to {output_file}")
-            return
+    if end_sec is None:
+        # Remove until end: only keep before start
+        filter_complex = f0 + a0 + "[v0][a0]concat=n=1:v=1:a=1[outv][outa]"
+    else:
+        # Part after removal: from end_sec to EOF
+        f1 = f"[0:v]trim=start={end_sec},setpts=PTS-STARTPTS[v1];"
+        a1 = f"[0:a]atrim=start={end_sec},asetpts=PTS-STARTPTS[a1];"
+        filter_complex = (
+            f0 + a0 +
+            f1 + a1 +
+            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"
+        )
 
-        # Extract the segment after the removal end
-        cmd2 = [
-            "ffmpeg", "-y", "-ss", args.end, "-i", input_file,
-            "-c", "copy", part2
-        ]
-        run_ffmpeg(cmd2)
+    cmd = [
+        "ffmpeg", "-y", "-i", input_file,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-c:a", "aac",
+        output_file
+    ]
 
-        # Create the concat list
-        with open(files_txt, "w") as f:
-            f.write(f"file '{part1}'\nfile '{part2}'\n")
-
-        # Concatenate parts
-        cmd_concat = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", files_txt, "-c", "copy", output_file
-        ]
-        run_ffmpeg(cmd_concat)
-
+    print("Running: " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
     print(f"Output written to {output_file}")
 
 if __name__ == "__main__":
